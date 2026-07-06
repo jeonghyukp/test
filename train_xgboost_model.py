@@ -1,245 +1,199 @@
-import numpy as np
-import pandas as pd
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import StandardScaler
-import xgboost as xgb
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-import matplotlib.pyplot as plt
-import seaborn as sns
-import joblib
+"""
+CHO cell 배양 공정 - VCD & IgG 예측 XGBoost 모델 학습
+
+두 개의 XGBoost 회귀 모델을 학습한다.
+  - VCD (Viable Cell Density, million cells/mL)
+  - IgG_Titer (g/L)
+
+각 타깃별로 성능을 평가하고, 실제-예측 산점도 / 잔차 / 특성 중요도 그래프와
+대표 조건에서의 배양 궤적(VCD, IgG vs 배양일) 그래프를 저장한다.
+"""
+
 import json
 
-# 스타일 설정
-plt.style.use('seaborn-v0_8-darkgrid')
-sns.set_palette("husl")
+import joblib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import cross_val_score, train_test_split
 
-def load_and_prepare_data(data_path='cho_culture_data.csv'):
-    """데이터 로드 및 전처리"""
+from generate_cho_data import FEATURES, TARGETS
+
+plt.style.use("seaborn-v0_8-darkgrid")
+
+MODEL_PATHS = {
+    "VCD": "xgboost_vcd_model.pkl",
+    "IgG_Titer": "xgboost_igg_model.pkl",
+}
+TARGET_UNITS = {"VCD": "million cells/mL", "IgG_Titer": "g/L"}
+XGB_PARAMS = dict(
+    n_estimators=300,
+    max_depth=5,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    min_child_weight=3,
+    reg_lambda=1.0,
+    random_state=42,
+    objective="reg:squarederror",
+)
+
+
+def load_and_prepare_data(data_path="cho_culture_data.csv"):
     df = pd.read_csv(data_path)
+    X = df[FEATURES]
+    y = df[TARGETS]
+    return train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # 특성과 타겟 분리
-    X = df.drop('IgG_Titer', axis=1)
-    y = df['IgG_Titer']
 
-    # 훈련/테스트 분할
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
-
-    return X, y, X_train, X_test, y_train, y_test
-
-def train_xgboost_model(X_train, X_test, y_train, y_test):
-    """XGBoost 모델 학습"""
-    print("\n" + "=" * 60)
-    print("XGBoost 모델 학습")
-    print("=" * 60)
-
-    # XGBoost 회귀 모델 생성
-    model = xgb.XGBRegressor(
-        n_estimators=200,
-        max_depth=6,
-        learning_rate=0.1,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        objective='reg:squarederror',
-        verbosity=1
-    )
-
-    # 모델 학습
+def train_one_model(target, X_train, y_train, X_test, y_test):
+    """단일 타깃에 대한 XGBoost 모델을 학습한다."""
+    model = xgb.XGBRegressor(**XGB_PARAMS)
     model.fit(
         X_train, y_train,
         eval_set=[(X_test, y_test)],
-        verbose=False
+        verbose=False,
     )
-
     return model
 
-def evaluate_model(model, X_train, X_test, y_train, y_test):
-    """모델 평가"""
-    print("\n" + "=" * 60)
-    print("모델 평가")
-    print("=" * 60)
 
-    # 예측
-    y_train_pred = model.predict(X_train)
-    y_test_pred = model.predict(X_test)
-
-    # 평가 지표
-    train_rmse = np.sqrt(mean_squared_error(y_train, y_train_pred))
-    test_rmse = np.sqrt(mean_squared_error(y_test, y_test_pred))
-    train_mae = mean_absolute_error(y_train, y_train_pred)
-    test_mae = mean_absolute_error(y_test, y_test_pred)
-    train_r2 = r2_score(y_train, y_train_pred)
-    test_r2 = r2_score(y_test, y_test_pred)
-
-    print(f"\n훈련 데이터:")
-    print(f"  RMSE: {train_rmse:.4f}")
-    print(f"  MAE:  {train_mae:.4f}")
-    print(f"  R²:   {train_r2:.4f}")
-
-    print(f"\n테스트 데이터:")
-    print(f"  RMSE: {test_rmse:.4f}")
-    print(f"  MAE:  {test_mae:.4f}")
-    print(f"  R²:   {test_r2:.4f}")
-
+def evaluate(model, target, X_train, y_train, X_test, y_test):
+    """타깃별 성능 지표를 계산한다."""
+    pred_train = model.predict(X_train)
+    pred_test = model.predict(X_test)
+    cv = cross_val_score(
+        xgb.XGBRegressor(**XGB_PARAMS),
+        X_train, y_train, cv=5, scoring="r2",
+    )
     metrics = {
-        'train_rmse': float(train_rmse),
-        'test_rmse': float(test_rmse),
-        'train_mae': float(train_mae),
-        'test_mae': float(test_mae),
-        'train_r2': float(train_r2),
-        'test_r2': float(test_r2),
+        "train_rmse": float(np.sqrt(mean_squared_error(y_train, pred_train))),
+        "test_rmse": float(np.sqrt(mean_squared_error(y_test, pred_test))),
+        "train_mae": float(mean_absolute_error(y_train, pred_train)),
+        "test_mae": float(mean_absolute_error(y_test, pred_test)),
+        "train_r2": float(r2_score(y_train, pred_train)),
+        "test_r2": float(r2_score(y_test, pred_test)),
+        "cv_r2_mean": float(cv.mean()),
+        "cv_r2_std": float(cv.std()),
     }
+    print(f"\n[{target}]  ({TARGET_UNITS[target]})")
+    print(f"  Train : RMSE={metrics['train_rmse']:.4f}  MAE={metrics['train_mae']:.4f}  R2={metrics['train_r2']:.4f}")
+    print(f"  Test  : RMSE={metrics['test_rmse']:.4f}  MAE={metrics['test_mae']:.4f}  R2={metrics['test_r2']:.4f}")
+    print(f"  5-fold CV R2 = {metrics['cv_r2_mean']:.4f} +/- {metrics['cv_r2_std']:.4f}")
+    return metrics, pred_test
 
-    return metrics, y_train_pred, y_test_pred
 
-def plot_results(model, X_train, X_test, y_train, y_test, y_train_pred, y_test_pred, metrics):
-    """결과 시각화"""
-    print("\n" + "=" * 60)
-    print("결과 시각화")
-    print("=" * 60)
+def plot_evaluation(models, data, predictions, metrics):
+    """타깃(행) x [실제-예측, 잔차, 특성 중요도](열) 그래프."""
+    X_train, X_test, y_train, y_test = data
+    fig, axes = plt.subplots(len(TARGETS), 3, figsize=(17, 10))
+    fig.suptitle("CHO Cell Culture - VCD & IgG Prediction (XGBoost)",
+                 fontsize=15, fontweight="bold")
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    fig.suptitle('CHO Cell 배양 공정 IgG 예측 모델 평가', fontsize=16, fontweight='bold')
+    for row, target in enumerate(TARGETS):
+        unit = TARGET_UNITS[target]
+        y_true = y_test[target].values
+        y_pred = predictions[target]
 
-    # 1. 훈련/테스트 실제값 vs 예측값
-    ax = axes[0, 0]
-    ax.scatter(y_train, y_train_pred, alpha=0.5, label='훈련 데이터', s=30)
-    ax.scatter(y_test, y_test_pred, alpha=0.5, label='테스트 데이터', s=30)
-    ax.plot([y_train.min(), y_train.max()], [y_train.min(), y_train.max()], 'k--', lw=2)
-    ax.set_xlabel('실제 IgG Titer (g/L)', fontsize=11)
-    ax.set_ylabel('예측 IgG Titer (g/L)', fontsize=11)
-    ax.set_title('실제값 vs 예측값', fontsize=12, fontweight='bold')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+        # 1) 실제 vs 예측
+        ax = axes[row, 0]
+        ax.scatter(y_true, y_pred, alpha=0.5, s=25, color="#2c7fb8")
+        lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
+        ax.plot(lims, lims, "k--", lw=2)
+        ax.set_xlabel(f"Actual {target} ({unit})")
+        ax.set_ylabel(f"Predicted {target} ({unit})")
+        ax.set_title(f"{target}: Actual vs Predicted (R2={metrics[target]['test_r2']:.3f})",
+                     fontweight="bold")
 
-    # 2. 잔차 분포
-    ax = axes[0, 1]
-    train_residuals = y_train - y_train_pred
-    test_residuals = y_test - y_test_pred
-    ax.hist(train_residuals, bins=30, alpha=0.6, label='훈련 잔차')
-    ax.hist(test_residuals, bins=30, alpha=0.6, label='테스트 잔차')
-    ax.axvline(0, color='k', linestyle='--', lw=2)
-    ax.set_xlabel('잔차 (실제값 - 예측값)', fontsize=11)
-    ax.set_ylabel('빈도', fontsize=11)
-    ax.set_title('잔차 분포', fontsize=12, fontweight='bold')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+        # 2) 잔차 분포
+        ax = axes[row, 1]
+        residuals = y_true - y_pred
+        ax.hist(residuals, bins=30, color="#7fcdbb", edgecolor="white")
+        ax.axvline(0, color="k", linestyle="--", lw=2)
+        ax.set_xlabel(f"Residual ({unit})")
+        ax.set_ylabel("Frequency")
+        ax.set_title(f"{target}: Residual Distribution", fontweight="bold")
 
-    # 3. 특성 중요도
-    ax = axes[1, 0]
-    feature_importance = pd.DataFrame({
-        'feature': X_train.columns,
-        'importance': model.feature_importances_
-    }).sort_values('importance', ascending=False)
-
-    ax.barh(feature_importance['feature'], feature_importance['importance'])
-    ax.set_xlabel('중요도', fontsize=11)
-    ax.set_title('특성 중요도', fontsize=12, fontweight='bold')
-    ax.grid(True, alpha=0.3, axis='x')
-
-    # 4. 성능 지표
-    ax = axes[1, 1]
-    ax.axis('off')
-
-    metrics_text = f"""
-    성능 지표
-
-    훈련 데이터:
-      • RMSE: {metrics['train_rmse']:.4f} g/L
-      • MAE:  {metrics['train_mae']:.4f} g/L
-      • R²:   {metrics['train_r2']:.4f}
-
-    테스트 데이터:
-      • RMSE: {metrics['test_rmse']:.4f} g/L
-      • MAE:  {metrics['test_mae']:.4f} g/L
-      • R²:   {metrics['test_r2']:.4f}
-
-    모델 구성:
-      • 트리 개수: 200
-      • 최대 깊이: 6
-      • 학습률: 0.1
-    """
-
-    ax.text(0.05, 0.95, metrics_text, transform=ax.transAxes,
-            fontsize=10, verticalalignment='top', fontfamily='monospace',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        # 3) 특성 중요도
+        ax = axes[row, 2]
+        imp = pd.DataFrame({
+            "feature": FEATURES,
+            "importance": models[target].feature_importances_,
+        }).sort_values("importance")
+        ax.barh(imp["feature"], imp["importance"], color="#41b6c4")
+        ax.set_xlabel("Importance")
+        ax.set_title(f"{target}: Feature Importance", fontweight="bold")
 
     plt.tight_layout()
-    plt.savefig('igg_prediction_results.png', dpi=300, bbox_inches='tight')
-    print("✓ 그래프 저장: igg_prediction_results.png")
+    plt.savefig("model_evaluation.png", dpi=200, bbox_inches="tight")
+    plt.close()
+    print("\n[OK] 그래프 저장: model_evaluation.png")
 
-def plot_feature_analysis(X_train, model):
-    """특성 분석 시각화"""
-    print("\n특성 분석 시각화 생성 중...")
 
-    feature_importance = pd.DataFrame({
-        'feature': X_train.columns,
-        'importance': model.feature_importances_
-    }).sort_values('importance', ascending=False)
+def plot_culture_trajectory(models):
+    """대표 배양 조건에서 배양일에 따른 VCD/IgG 예측 궤적."""
+    days = np.arange(0, 15)
+    base = {
+        "Temperature": 34.0, "pH": 7.1, "Dissolved_Oxygen": 55.0,
+        "Glucose": 5.0, "Glutamine": 4.0, "Ammonia": 2.0, "Seeding_Density": 0.5,
+    }
+    grid = pd.DataFrame([{**base, "Culture_Day": d} for d in days])[FEATURES]
+    vcd_pred = np.clip(models["VCD"].predict(grid), 0, None)
+    igg_pred = np.clip(models["IgG_Titer"].predict(grid), 0, None)
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    colors = plt.cm.viridis(np.linspace(0, 1, len(feature_importance)))
-    bars = ax.barh(feature_importance['feature'], feature_importance['importance'], color=colors)
+    fig, ax1 = plt.subplots(figsize=(9, 5.5))
+    ax1.plot(days, vcd_pred, "o-", color="#2c7fb8", lw=2, label="VCD")
+    ax1.set_xlabel("Culture Day")
+    ax1.set_ylabel("VCD (million cells/mL)", color="#2c7fb8")
+    ax1.tick_params(axis="y", labelcolor="#2c7fb8")
 
-    ax.set_xlabel('중요도 점수', fontsize=12, fontweight='bold')
-    ax.set_title('XGBoost 모델 - 특성 중요도', fontsize=14, fontweight='bold')
-    ax.grid(True, alpha=0.3, axis='x')
+    ax2 = ax1.twinx()
+    ax2.plot(days, igg_pred, "s--", color="#d95f0e", lw=2, label="IgG Titer")
+    ax2.set_ylabel("IgG Titer (g/L)", color="#d95f0e")
+    ax2.tick_params(axis="y", labelcolor="#d95f0e")
+    ax2.grid(False)
 
-    # 값 표시
-    for i, (idx, row) in enumerate(feature_importance.iterrows()):
-        ax.text(row['importance'], i, f" {row['importance']:.4f}", va='center', fontsize=10)
+    plt.title("Predicted Culture Trajectory (T=34C, pH=7.1, Glc=5 g/L)",
+              fontweight="bold")
+    fig.tight_layout()
+    plt.savefig("culture_trajectory.png", dpi=200, bbox_inches="tight")
+    plt.close()
+    print("[OK] 그래프 저장: culture_trajectory.png")
 
-    plt.tight_layout()
-    plt.savefig('feature_importance.png', dpi=300, bbox_inches='tight')
-    print("✓ 그래프 저장: feature_importance.png")
-
-def save_model(model, model_path='xgboost_igg_model.pkl'):
-    """모델 저장"""
-    joblib.dump(model, model_path)
-    print(f"\n✓ 모델 저장: {model_path}")
 
 def main():
-    print("\n" + "=" * 60)
-    print("CHO Cell 배양 공정 IgG 예측 모델")
+    print("=" * 60)
+    print("CHO Cell 배양 공정 - VCD & IgG 예측 모델 학습")
     print("=" * 60)
 
-    # 데이터 로드
-    print("\n데이터 로드 중...")
-    X, y, X_train, X_test, y_train, y_test = load_and_prepare_data()
-    print(f"✓ 데이터 로드 완료")
-    print(f"  - 훈련 샘플: {len(X_train)}")
-    print(f"  - 테스트 샘플: {len(X_test)}")
-    print(f"  - 특성 개수: {X_train.shape[1]}")
+    X_train, X_test, y_train, y_test = load_and_prepare_data()
+    print(f"\n훈련 샘플: {len(X_train)} | 테스트 샘플: {len(X_test)} | 특성: {len(FEATURES)}")
 
-    # 모델 학습
-    model = train_xgboost_model(X_train, X_test, y_train, y_test)
-    print("\n✓ 모델 학습 완료")
+    models, all_metrics, predictions = {}, {}, {}
+    for target in TARGETS:
+        model = train_one_model(target, X_train, y_train[target], X_test, y_test[target])
+        metrics, pred_test = evaluate(model, target, X_train, y_train[target],
+                                      X_test, y_test[target])
+        joblib.dump(model, MODEL_PATHS[target])
+        models[target] = model
+        all_metrics[target] = metrics
+        predictions[target] = pred_test
 
-    # 모델 평가
-    metrics, y_train_pred, y_test_pred = evaluate_model(model, X_train, X_test, y_train, y_test)
+    plot_evaluation(models, (X_train, X_test, y_train, y_test), predictions, all_metrics)
+    plot_culture_trajectory(models)
 
-    # 결과 시각화
-    plot_results(model, X_train, X_test, y_train, y_test, y_train_pred, y_test_pred, metrics)
-    plot_feature_analysis(X_train, model)
-
-    # 모델 저장
-    save_model(model)
-
-    # 메트릭 저장
-    with open('metrics.json', 'w') as f:
-        json.dump(metrics, f, indent=2)
-    print("✓ 메트릭 저장: metrics.json")
+    with open("metrics.json", "w") as f:
+        json.dump(all_metrics, f, indent=2)
 
     print("\n" + "=" * 60)
-    print("모델 학습 완료!")
+    print("학습 완료! 생성된 파일:")
+    print("  - xgboost_vcd_model.pkl / xgboost_igg_model.pkl : 학습된 모델")
+    print("  - model_evaluation.png    : 타깃별 평가 그래프")
+    print("  - culture_trajectory.png  : 배양 궤적 예측 그래프")
+    print("  - metrics.json            : 성능 지표")
     print("=" * 60)
-    print("\n생성된 파일:")
-    print("  • xgboost_igg_model.pkl - 학습된 모델")
-    print("  • igg_prediction_results.png - 평가 그래프")
-    print("  • feature_importance.png - 특성 중요도 그래프")
-    print("  • metrics.json - 성능 지표")
+
 
 if __name__ == "__main__":
     main()
