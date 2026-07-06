@@ -10,6 +10,7 @@ CHO cell 배양 공정 - VCD & IgG 예측 XGBoost 모델 학습
 """
 
 import json
+import os
 
 import joblib
 import matplotlib.pyplot as plt
@@ -28,7 +29,11 @@ MODEL_PATHS = {
     "IgG_Titer": "xgboost_igg_model.pkl",
 }
 TARGET_UNITS = {"VCD": "million cells/mL", "IgG_Titer": "g/L"}
-XGB_PARAMS = dict(
+
+# 항상 고정하는 파라미터
+FIXED_PARAMS = dict(random_state=42, objective="reg:squarederror")
+# Bayesian 튜닝을 하지 않았을 때 사용하는 기본 하이퍼파라미터
+DEFAULT_TUNABLE = dict(
     n_estimators=300,
     max_depth=5,
     learning_rate=0.05,
@@ -36,9 +41,25 @@ XGB_PARAMS = dict(
     colsample_bytree=0.8,
     min_child_weight=3,
     reg_lambda=1.0,
-    random_state=42,
-    objective="reg:squarederror",
 )
+BEST_PARAMS_PATH = "best_params.json"
+
+
+def resolve_params(target):
+    """타깃별 하이퍼파라미터를 결정한다.
+
+    best_params.json(Bayesian optimization 결과)이 있으면 그 값을,
+    없으면 DEFAULT_TUNABLE을 사용한다. 고정 파라미터는 항상 병합한다.
+    """
+    tunable = DEFAULT_TUNABLE
+    source = "default"
+    if os.path.exists(BEST_PARAMS_PATH):
+        with open(BEST_PARAMS_PATH) as f:
+            best = json.load(f)
+        if target in best and best[target].get("params"):
+            tunable = best[target]["params"]
+            source = "tuned (Bayesian optimization)"
+    return {**FIXED_PARAMS, **tunable}, source
 
 
 def load_and_prepare_data(data_path="cho_culture_data.csv"):
@@ -50,7 +71,9 @@ def load_and_prepare_data(data_path="cho_culture_data.csv"):
 
 def train_one_model(target, X_train, y_train, X_test, y_test):
     """단일 타깃에 대한 XGBoost 모델을 학습한다."""
-    model = xgb.XGBRegressor(**XGB_PARAMS)
+    params, source = resolve_params(target)
+    print(f"  하이퍼파라미터 소스: {source}")
+    model = xgb.XGBRegressor(**params)
     model.fit(
         X_train, y_train,
         eval_set=[(X_test, y_test)],
@@ -61,10 +84,11 @@ def train_one_model(target, X_train, y_train, X_test, y_test):
 
 def evaluate(model, target, X_train, y_train, X_test, y_test):
     """타깃별 성능 지표를 계산한다."""
+    params, _ = resolve_params(target)
     pred_train = model.predict(X_train)
     pred_test = model.predict(X_test)
     cv = cross_val_score(
-        xgb.XGBRegressor(**XGB_PARAMS),
+        xgb.XGBRegressor(**params),
         X_train, y_train, cv=5, scoring="r2",
     )
     metrics = {
@@ -172,6 +196,7 @@ def main():
 
     models, all_metrics, predictions = {}, {}, {}
     for target in TARGETS:
+        print(f"\n--- [{target}] 학습 ---")
         model = train_one_model(target, X_train, y_train[target], X_test, y_test[target])
         metrics, pred_test = evaluate(model, target, X_train, y_train[target],
                                       X_test, y_test[target])

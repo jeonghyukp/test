@@ -32,6 +32,15 @@ FEATURE_RANGES = {
 FEATURES = list(FEATURE_RANGES.keys())
 TARGETS = ["VCD", "IgG_Titer"]
 
+# Day 14 수확 시점에서 기준 배양 조건의 목표 최종 titer (g/L).
+# IgG 변환 스케일은 아래 REFERENCE_CONDITION이 Day 14에 이 값을 내도록 자동 보정된다.
+TARGET_FINAL_TITER = 3.0
+REFERENCE_CONDITION = {
+    "Temperature": 34.0, "pH": 7.1, "Dissolved_Oxygen": 55.0,
+    "Glucose": 5.0, "Glutamine": 4.0, "Ammonia": 2.0, "Seeding_Density": 0.5,
+}
+FINAL_DAY = 14
+
 
 def _optimum_factor(x, opt, width):
     """최적점 opt에서 1.0, 멀어질수록 0으로 감소하는 가우시안 형태의 반응 계수."""
@@ -82,16 +91,37 @@ def _integrated_vcd(df, vmax, t_peak, width):
     return np.clip(ivcd, 0.0, None)
 
 
-def _igg_titer(df, growth, ivcd):
-    """IVCD와 비생산성(qP)으로부터 누적 IgG titer(g/L)를 계산한다."""
+def _igg_titer(df, growth, ivcd, scale):
+    """IVCD와 비생산성(qP)으로부터 누적 IgG titer(g/L)를 계산한다.
+
+    scale은 pg/cell/day * (Mcells/mL*day) 를 g/L로 바꾸는 변환 상수이며,
+    _calibrate_igg_scale()로 목표 최종 titer에 맞게 자동 보정된다.
+    """
     # 저온에서 qP 상승 (mild hypothermia productivity boost)
     hypothermia_boost = 1.0 + 0.18 * (37.0 - df["Temperature"])
     nutrient_f = _monod(df["Glucose"], 1.0) * _monod(df["Glutamine"], 0.5)
     amm_f = 1.0 / (1.0 + (df["Ammonia"] / 8.0) ** 2)
     qp = 25.0 * np.clip(hypothermia_boost, 0.6, 2.2) * (0.5 + 0.5 * nutrient_f) * amm_f
-    # 단위 변환 상수 (pg/cell/day * Mcells/mL*day -> g/L 스케일 조정)
-    igg = qp * ivcd * 1.3e-3
-    return igg
+    return qp * ivcd * scale
+
+
+def _noiseless_igg(df, scale):
+    """주어진 조건 DataFrame에 대한 노이즈 없는 IgG titer를 계산한다."""
+    growth = _growth_factor(df)
+    _, vmax, t_peak, width = _viable_cell_density(df, growth)
+    ivcd = _integrated_vcd(df, vmax, t_peak, width)
+    return _igg_titer(df, growth, ivcd, scale)
+
+
+def _calibrate_igg_scale(target_titer=TARGET_FINAL_TITER):
+    """기준 조건이 Day 14(FINAL_DAY)에 target_titer(g/L)를 내도록 변환 스케일을 계산한다."""
+    ref = pd.DataFrame([{**REFERENCE_CONDITION, "Culture_Day": FINAL_DAY}])[FEATURES]
+    unit_titer = float(_noiseless_igg(ref, scale=1.0).iloc[0])
+    return target_titer / unit_titer
+
+
+# 기준 배양 조건이 Day 14에 TARGET_FINAL_TITER를 내도록 보정된 IgG 변환 스케일
+IGG_SCALE = _calibrate_igg_scale()
 
 
 def generate_cho_culture_data(n_samples=1200):
@@ -107,7 +137,7 @@ def generate_cho_culture_data(n_samples=1200):
     growth = _growth_factor(df)
     vcd, vmax, t_peak, width = _viable_cell_density(df, growth)
     ivcd = _integrated_vcd(df, vmax, t_peak, width)
-    igg = _igg_titer(df, growth, ivcd)
+    igg = _igg_titer(df, growth, ivcd, IGG_SCALE)
 
     # 측정 노이즈 추가
     vcd = vcd + np.random.normal(0.0, 0.35, n_samples)
@@ -135,3 +165,11 @@ if __name__ == "__main__":
 
     print("\n타깃 상관관계 (VCD vs IgG_Titer):")
     print(f"  Pearson r = {df['VCD'].corr(df['IgG_Titer']):.3f}")
+
+    # Day 14 최종 titer 캘리브레이션 검증
+    ref = pd.DataFrame([{**REFERENCE_CONDITION, "Culture_Day": FINAL_DAY}])[FEATURES]
+    ref_titer = float(_noiseless_igg(ref, IGG_SCALE).iloc[0])
+    print("\nDay 14 최종 titer 캘리브레이션 (기준 조건):")
+    print(f"  목표 = {TARGET_FINAL_TITER:.2f} g/L,  실제 = {ref_titer:.3f} g/L  (scale={IGG_SCALE:.4e})")
+    day14 = df[df["Culture_Day"] == FINAL_DAY]["IgG_Titer"]
+    print(f"  데이터셋 Day 14 titer:  평균 {day14.mean():.3f},  중앙값 {day14.median():.3f} g/L")
